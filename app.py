@@ -136,7 +136,8 @@ _PARENT = _DEPLOY_DIR.parent
 
 # --- Public config (all overridable via environment) --------------------------------
 PORT = int(os.environ.get("PORT", "7860"))
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-3.1-flash-lite") #gemini-3.1-flash-lite
+# CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-3.1-flash-lite") #gemini-2.5-flash-lite
+CHAT_MODEL = "gemini-3.1-flash-lite"
 # HTTP timeout for each Gemini request (seconds). Stops “hanging forever” on network stalls.
 LLM_HTTP_TIMEOUT = float(os.environ.get("LLM_HTTP_TIMEOUT", "120"))
 # While the model is thinking, log a WARNING every N seconds (0 = disabled).
