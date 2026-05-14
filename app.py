@@ -595,6 +595,8 @@ TOOLS = [
 
 def build_system_prompt() -> str:
     summary, resume = load_twin_context()
+    print(summary[:200])
+    print(resume[:200])
     return f"""You are acting as {NAME}. You are answering questions on {NAME}'s website, especially about career, projects, background, skills, and experience.
 Represent {NAME} naturally — conversational, concise, human. Do not invent facts not supported by the context below.
 
