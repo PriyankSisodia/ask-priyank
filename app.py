@@ -50,7 +50,7 @@ STEP B — Google Sheet for contacts + unknown questions (optional but recommend
 --------------------------------------------------------------------------------
 STEP C — Where the model reads “summary” + “resume” (sources merge)
 --------------------------------------------------------------------------------
-
+!pip install -r requirements.txt
 Values are combined in order; each step only fills fields still empty:
 
 1. **Sheet tab ``twin_context``** (needs ``GOOGLE_SHEET_ID`` + JSON key) — edit in
@@ -148,6 +148,7 @@ GEMINI_BASE_URL = os.environ.get(
 CONTEXT_URL = os.environ.get("CONTEXT_URL", "").strip()
 CONTEXT_CACHE_SECONDS = int(os.environ.get("CONTEXT_CACHE_SECONDS", "120"))
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+print(f"GOOGLE_SHEET_ID: {GOOGLE_SHEET_ID}")
 GSPREAD_JSON = os.environ.get("GSPREAD_SERVICE_ACCOUNT_JSON", "").strip()
 ALLOW_LOCAL_FILES = os.environ.get("ALLOW_LOCAL_CONTEXT_FILES", "").lower() in (
     "1",
