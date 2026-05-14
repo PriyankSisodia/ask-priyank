@@ -1,0 +1,23 @@
+# Render Blueprint — repo root = `agents` (parent of _agentic_ai).
+# New → Blueprint → select this file, or set the same values manually.
+#
+# Manual:
+#   Root Directory:  _agentic_ai/ask priyank/deploy
+#   Build Command:   pip install -r requirements.txt
+#   Start Command:   python app.py
+
+services:
+  - type: web
+    name: ask-priyank-twin
+    runtime: python
+    rootDir: _agentic_ai/ask priyank/deploy
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      # Set in Render dashboard (secrets):
+      # - GEMINI_API_KEY or GOOGLE_API_KEY
+      # - GOOGLE_SHEET_ID + GSPREAD_SERVICE_ACCOUNT_JSON (logging + optional twin_context tab)
+      # - CONTEXT_URL or TWIN_SUMMARY / TWIN_RESUME_TEXT
+      # Optional: CHAT_MODEL, TWIN_DISPLAY_NAME, CONTEXT_CACHE_SECONDS

@@ -1,0 +1,6 @@
+gradio>=4.44,<6
+openai>=1.40
+python-dotenv>=1.0
+pypdf>=4.0
+gspread>=6.0
+google-auth>=2.29
