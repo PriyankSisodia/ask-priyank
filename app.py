@@ -33,7 +33,7 @@ STEP B — Google Sheet for contacts + unknown questions (optional but recommend
 2. IAM → Service Accounts → create → Keys → JSON. Copy ``client_email``.
 3. New Google Sheet → **Share** with that email as **Editor**.
 4. Copy spreadsheet ID from the URL::
-   https://docs.google.com/spreadsheets/d/<SHEET_ID>/edit
+   https://docs.google.com/spreadsheets/d/1NEphTLimwNlo_28Bx2T78oP26NkiPzgDMoQy6ebSA6k/edit
 
 5. In Render (or ``.env`` locally), set **one line** JSON::
 
@@ -78,6 +78,9 @@ STEP D — Deploy on Render (free tier)
     GEMINI_API_KEY=<key>          # or GOOGLE_API_KEY
     CHAT_MODEL=gemini-2.5-flash-lite   # optional
     TWIN_DISPLAY_NAME=Priyank Sisodia  # optional
+    LLM_HTTP_TIMEOUT=120          # optional: HTTP timeout per Gemini request (seconds)
+    CHAT_HEARTBEAT_SEC=60         # optional: log WARNING every N sec while waiting (0=off)
+    LOG_LEVEL=INFO                # optional: DEBUG for more verbose logs
 
    Plus one context source from STEP C, and optionally Sheet vars from STEP B.
 
@@ -98,6 +101,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -120,7 +124,11 @@ except ImportError:
 import gradio as gr
 from openai import OpenAI
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | ask_priyank | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 log = logging.getLogger("ask_priyank")
 
 _DEPLOY_DIR = Path(__file__).resolve().parent
@@ -129,6 +137,10 @@ _PARENT = _DEPLOY_DIR.parent
 # --- Public config (all overridable via environment) --------------------------------
 PORT = int(os.environ.get("PORT", "7860"))
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "gemini-2.5-flash-lite")
+# HTTP timeout for each Gemini request (seconds). Stops “hanging forever” on network stalls.
+LLM_HTTP_TIMEOUT = float(os.environ.get("LLM_HTTP_TIMEOUT", "120"))
+# While the model is thinking, log a WARNING every N seconds (0 = disabled).
+CHAT_HEARTBEAT_SEC = float(os.environ.get("CHAT_HEARTBEAT_SEC", "60"))
 NAME = os.environ.get("TWIN_DISPLAY_NAME", "Priyank Sisodia")
 GEMINI_BASE_URL = os.environ.get(
     "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -142,6 +154,53 @@ ALLOW_LOCAL_FILES = os.environ.get("ALLOW_LOCAL_CONTEXT_FILES", "").lower() in (
     "true",
     "yes",
 )
+
+
+class _LongWaitHeartbeat:
+    """Log every ``interval_sec`` while a blocking HTTP call runs (watch the terminal)."""
+
+    def __init__(self, interval_sec: float, label: str) -> None:
+        self.interval_sec = max(0.0, float(interval_sec))
+        self.label = label
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.interval_sec <= 0:
+            return
+
+        def _run() -> None:
+            n = 0
+            while not self._stop.wait(self.interval_sec):
+                n += 1
+                log.warning("%s — still waiting (%d min elapsed)", self.label, n)
+
+        self._thread = threading.Thread(target=_run, daemon=True, name="llm-heartbeat")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def log_startup_diagnostics() -> None:
+    """Run once at launch; helps confirm env and keys without printing secrets."""
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    log.info("=== Ask Priyank startup ===")
+    log.info("PORT=%s CHAT_MODEL=%s", PORT, CHAT_MODEL)
+    log.info(
+        "Gemini API key: %s",
+        "set (%d chars)" % len(key) if key else "MISSING — set GEMINI_API_KEY or GOOGLE_API_KEY",
+    )
+    log.info("LLM_HTTP_TIMEOUT=%s CHAT_HEARTBEAT_SEC=%s", LLM_HTTP_TIMEOUT, CHAT_HEARTBEAT_SEC)
+    log.info(
+        "Google Sheet: GOOGLE_SHEET_ID=%s GSPREAD_JSON=%s",
+        "set" if GOOGLE_SHEET_ID else "unset",
+        "set" if GSPREAD_JSON else "unset",
+    )
+    log.info("CONTEXT_URL=%s ALLOW_LOCAL_CONTEXT_FILES=%s", bool(CONTEXT_URL), ALLOW_LOCAL_FILES)
+    log.info("Logs: watch this terminal (stdout). On Render: Dashboard → your service → Logs.")
+    log.info("=== end startup ===")
+
 
 _SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 _gspread_client = None
@@ -193,6 +252,7 @@ def _gspread_authorize():
 def _load_context_from_sheet() -> tuple[str, str] | None:
     if not GOOGLE_SHEET_ID or not GSPREAD_JSON:
         return None
+    log.info("Context: reading Google Sheet twin_context…")
     try:
         import gspread
 
@@ -262,8 +322,11 @@ def load_twin_context() -> tuple[str, str]:
     now = time.monotonic()
     prev_s, prev_r, t0 = _context_cache
     if (now - t0) < CONTEXT_CACHE_SECONDS and (prev_s or prev_r):
+        log.debug("Context: using cache (age %.1fs)", now - t0)
         return prev_s, prev_r
 
+    log.info("Context: loading (cache miss or expired)…")
+    t_load = time.monotonic()
     summary, resume = "", ""
 
     sheet_pair = _load_context_from_sheet()
@@ -316,6 +379,12 @@ def load_twin_context() -> tuple[str, str]:
         )
 
     _context_cache = (summary, resume, now)
+    log.info(
+        "Context: load finished in %.2fs (summary=%d chars, resume=%d chars)",
+        time.monotonic() - t_load,
+        len(summary),
+        len(resume),
+    )
     return summary, resume
 
 
@@ -368,9 +437,14 @@ def _gemini_client() -> OpenAI:
     key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
         raise RuntimeError("Set GEMINI_API_KEY or GOOGLE_API_KEY for the chat model.")
-    return OpenAI(base_url=GEMINI_BASE_URL, api_key=key)
+    return OpenAI(
+        base_url=GEMINI_BASE_URL,
+        api_key=key,
+        timeout=LLM_HTTP_TIMEOUT,
+    )
 
 
+def _normalize_tool_call(tc: Any) -> SimpleNamespace:
     if isinstance(tc, dict):
         tid = tc.get("id") or ""
         fn = tc.get("function")
@@ -451,8 +525,33 @@ def _parse_choice(choice: Any) -> tuple[str, list[SimpleNamespace] | None, dict[
 
 def llm_chat(model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> LLMResponse:
     client = _gemini_client()
-    raw = client.chat.completions.create(model=model, messages=messages, tools=tools)
+    hb = _LongWaitHeartbeat(CHAT_HEARTBEAT_SEC, f"Gemini HTTP model={model!r}")
+    hb.start()
+    t0 = time.monotonic()
+    try:
+        log.info(
+            "LLM: POST chat.completions (model=%s, messages=%d, tools=%d, timeout=%ss)",
+            model,
+            len(messages),
+            len(tools),
+            LLM_HTTP_TIMEOUT,
+        )
+        raw = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            timeout=LLM_HTTP_TIMEOUT,
+        )
+    except Exception:
+        log.exception("LLM: request failed after %.2fs", time.monotonic() - t0)
+        raise
+    finally:
+        hb.stop()
+
+    elapsed = time.monotonic() - t0
     choice = raw.choices[0]
+    fr = getattr(choice, "finish_reason", None)
+    log.info("LLM: response in %.2fs finish_reason=%s", elapsed, fr)
     text, tool_calls, assistant = _parse_choice(choice)
     return LLMResponse(text=text or "", tool_calls=tool_calls, assistant_message=assistant)
 
@@ -526,6 +625,7 @@ def handle_tool_calls(tool_calls: list[SimpleNamespace]) -> list[dict[str, Any]]
     for tc in tool_calls:
         tool_name = tc.function.name
         arguments = json.loads(tc.function.arguments or "{}")
+        log.info("Tool: executing %s", tool_name)
         fn = globals().get(tool_name)
         result = fn(**arguments) if callable(fn) else {}
         results.append({"role": "tool", "content": json.dumps(result), "tool_call_id": tc.id})
@@ -541,20 +641,31 @@ def _scrub_assistant_message(msg: dict) -> dict:
 
 def chat(message: str, history: list, model: str = CHAT_MODEL):
     """Gradio ``type="messages"`` callback: ``history`` is list of dicts role/content."""
+    t_chat = time.monotonic()
+    log.info("Chat: new user message (%d chars), history_len=%d", len(message or ""), len(history))
     history_msgs = [{"role": h["role"], "content": h["content"]} for h in history]
+
+    t0 = time.monotonic()
+    system_content = build_system_prompt()
+    log.info("Chat: system prompt built in %.2fs (%d chars)", time.monotonic() - t0, len(system_content))
+
     messages: list[dict[str, Any]] = (
-        [{"role": "system", "content": build_system_prompt()}]
-        + history_msgs
-        + [{"role": "user", "content": message}]
+        [{"role": "system", "content": system_content}] + history_msgs + [{"role": "user", "content": message}]
     )
+    round_n = 0
     while True:
+        round_n += 1
+        log.info("Chat: LLM round %d (messages=%d)", round_n, len(messages))
         response = llm_chat(model=model, messages=messages, tools=TOOLS)
         if response.is_tool_round:
-            messages.append(_scrub_assistant_message(response.assistant_message))
             assert response.tool_calls is not None
+            names = [tc.function.name for tc in response.tool_calls]
+            log.info("Chat: tool round — %s", names)
+            messages.append(_scrub_assistant_message(response.assistant_message))
             messages.extend(handle_tool_calls(response.tool_calls))
         else:
             text = (response.text or "").strip()
+            log.info("Chat: done in %.2fs (final text %d chars)", time.monotonic() - t_chat, len(text))
             return text or "Thanks — noted. Anything else?"
 
 
@@ -564,21 +675,35 @@ def chat(message: str, history: list, model: str = CHAT_MODEL):
 
 
 def launch_ui() -> None:
-    # Built-in soft theme + readable fonts (no extra assets).
-    theme = gr.themes.Soft(font=gr.themes.GoogleFont("DM Sans"))
+    log_startup_diagnostics()
+    theme = gr.themes.Soft(
+        font=gr.themes.GoogleFont("DM Sans"),
+        spacing_size=gr.themes.sizes.spacing_md,
+        radius_size=gr.themes.sizes.radius_md,
+    )
     title = f"Chat with {NAME}"
     desc = (
         "Career twin — answers from your private context (Sheet or env). "
         "Unanswered questions and contact emails may be saved to your Google Sheet if configured."
     )
+    _ui_css = """
+    .gradio-container { max-width: 900px !important; margin: 0 auto !important; }
+    .prose { line-height: 1.55; }
+    footer { opacity: 0.88; font-size: 0.82rem; }
+    """
     demo = gr.ChatInterface(
         chat,
         type="messages",
         title=title,
         description=desc,
         theme=theme,
+        css=_ui_css,
+        chatbot=gr.Chatbot(height=520, show_copy_button=True, latex_delimiters=[]),
         examples=["What are you working on lately?", "What tech stack do you prefer?"],
+        show_progress="full",
+        fill_width=True,
     )
+    log.info("Gradio UI starting on http://0.0.0.0:%s", PORT)
     demo.launch(server_name="0.0.0.0", server_port=PORT)
 
 
